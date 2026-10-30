@@ -8,9 +8,12 @@
     "start": "next start",
     "lint": "eslint",
     "db:migrate": "tsx db/migrate.ts",
-    "db:seed": "tsx db/seed.ts"
+    "db:seed": "tsx db/seed.ts",
+    "db:embed": "tsx db/backfill-embeddings.ts",
+    "db:setup": "npm run db:migrate && npm run db:seed && npm run db:embed"
   },
   "dependencies": {
+    "@huggingface/transformers": "^4.3.2",
     "bcryptjs": "^3.0.3",
     "jose": "^6.2.14",
     "next": "16.4.3",
