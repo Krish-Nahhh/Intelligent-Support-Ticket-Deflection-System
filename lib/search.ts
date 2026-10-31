@@ -1,7 +1,7 @@
 import { query } from "./db";
 import { toVectorLiteral } from "./embeddings";
 
-export const SIMILARITY_THRESHOLD = Number(process.env.SIMILARITY_THRESHOLD ?? 0.8);
+export const SIMILARITY_THRESHOLD = Number(process.env.SIMILARITY_THRESHOLD ?? 0.6);
 
 export async function findSimilarResolutions(embedding: number[], limit = 3) {
   const { rows } = await query(

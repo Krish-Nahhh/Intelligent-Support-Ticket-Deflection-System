@@ -21,7 +21,7 @@ CREATE TABLE tickets (
   description TEXT NOT NULL,
   status ticket_status NOT NULL DEFAULT 'open',
   priority TEXT DEFAULT 'medium',
-  embedding vector(1536),
+  embedding vector(384),
   created_at TIMESTAMPTZ DEFAULT now(),
   sla_due_at TIMESTAMPTZ,
   resolved_at TIMESTAMPTZ
