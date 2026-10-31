@@ -1,7 +1,6 @@
-
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useState, type FormEvent } from "react";
 
 type Ticket = {
   id: number;
@@ -60,6 +59,17 @@ function formatTicketId(id: number) {
   return `TKT-${String(id).padStart(4, "0")}`;
 }
 
+function toTicket(t: ApiTicket): Ticket {
+  return {
+    id: t.id,
+    title: t.title,
+    category: "Uncategorized",
+    priority: formatPriority(t.priority),
+    status: formatStatus(t.status),
+    created_at: t.created_at,
+  };
+}
+
 export default function Home() {
   const [activeNav, setActiveNav] = useState("Overview");
   const [search, setSearch] = useState("");
@@ -69,6 +79,55 @@ export default function Home() {
   const [tickets, setTickets] = useState<Ticket[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
+
+  const [showForm, setShowForm] = useState(false);
+  const [newTitle, setNewTitle] = useState("");
+  const [newDescription, setNewDescription] = useState("");
+  const [newPriority, setNewPriority] = useState("medium");
+  const [submitting, setSubmitting] = useState(false);
+  const [formError, setFormError] = useState("");
+  const [result, setResult] = useState<{
+    suggestion: { id: number; similarity: number; solution: string } | null;
+    routedToAgent: boolean;
+  } | null>(null);
+
+  async function submitTicket(e: FormEvent) {
+    e.preventDefault();
+    setSubmitting(true);
+    setFormError("");
+    setResult(null);
+    try {
+      const res = await fetch("/api/tickets", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          title: newTitle,
+          description: newDescription,
+          priority: newPriority,
+        }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || "Failed to create ticket");
+      setTickets((prev) => [toTicket(data.ticket), ...prev]);
+      setResult({
+        suggestion: data.suggestion,
+        routedToAgent: data.routedToAgent,
+      });
+      setNewTitle("");
+      setNewDescription("");
+    } catch (err) {
+      setFormError(
+        err instanceof Error ? err.message : "Failed to create ticket"
+      );
+    } finally {
+      setSubmitting(false);
+    }
+  }
+
+  async function logout() {
+    await fetch("/api/auth/logout", { method: "POST" });
+    window.location.href = "/login";
+  }
 
   useEffect(() => {
     let cancelled = false;
@@ -86,16 +145,9 @@ export default function Home() {
           throw new Error("Unexpected response from the ticket API");
         }
 
-        const loadedTickets: Ticket[] = (
-          data.tickets as ApiTicket[]
-        ).map((ticket) => ({
-          id: ticket.id,
-          title: ticket.title,
-          category: "Uncategorized",
-          priority: formatPriority(ticket.priority),
-          status: formatStatus(ticket.status),
-          created_at: ticket.created_at,
-        }));
+        const loadedTickets: Ticket[] = (data.tickets as ApiTicket[]).map(
+          toTicket
+        );
 
         if (!cancelled) {
           setTickets(loadedTickets);
@@ -136,8 +188,7 @@ export default function Home() {
         ].some((value) => value.toLowerCase().includes(query));
 
       const matchesStatus =
-        statusFilter === "All statuses" ||
-        ticket.status === statusFilter;
+        statusFilter === "All statuses" || ticket.status === statusFilter;
 
       const matchesPriority =
         priorityFilter === "All priorities" ||
@@ -237,18 +288,90 @@ export default function Home() {
             </p>
           </div>
 
-          <button
-            type="button"
-            onClick={() =>
-              window.alert(
-                "Ticket creation will be connected to the backend in a later step."
-              )
-            }
-            className="bg-[#2A4A3A] px-5 py-3 text-sm font-semibold text-[#F5F0E8] transition hover:bg-[#355D49]"
-          >
-            + New ticket
-          </button>
+          <div className="flex gap-3">
+            <button
+              type="button"
+              onClick={() => {
+                setShowForm((v) => !v);
+                setResult(null);
+                setFormError("");
+              }}
+              className="bg-[#2A4A3A] px-5 py-3 text-sm font-semibold text-[#F5F0E8] transition hover:bg-[#355D49]"
+            >
+              {showForm ? "Close" : "+ New ticket"}
+            </button>
+            <button
+              type="button"
+              onClick={logout}
+              className="border border-[#594438] px-5 py-3 text-sm font-semibold text-[#B8A697] transition hover:bg-[#38251B] hover:text-[#F5F0E8]"
+            >
+              Log out
+            </button>
+          </div>
         </header>
+
+        {showForm && (
+          <section className="border-b border-[#594438] py-7">
+            <form onSubmit={submitTicket} className="max-w-2xl space-y-4">
+              <input
+                value={newTitle}
+                onChange={(e) => setNewTitle(e.target.value)}
+                placeholder="Title"
+                required
+                className="w-full border border-[#594438] bg-transparent px-3 py-2 text-sm text-[#F5F0E8] outline-none placeholder:text-[#9E8B7A]"
+              />
+              <textarea
+                value={newDescription}
+                onChange={(e) => setNewDescription(e.target.value)}
+                placeholder="Describe the problem"
+                required
+                rows={4}
+                className="w-full border border-[#594438] bg-transparent px-3 py-2 text-sm text-[#F5F0E8] outline-none placeholder:text-[#9E8B7A]"
+              />
+              <select
+                value={newPriority}
+                onChange={(e) => setNewPriority(e.target.value)}
+                className="border border-[#594438] bg-[#2C1A0E] px-3 py-2 text-sm text-[#F5F0E8]"
+              >
+                <option value="low">Low</option>
+                <option value="medium">Medium</option>
+                <option value="high">High</option>
+              </select>
+              <div>
+                <button
+                  type="submit"
+                  disabled={submitting}
+                  className="bg-[#2A4A3A] px-5 py-3 text-sm font-semibold text-[#F5F0E8] disabled:opacity-50"
+                >
+                  {submitting ? "Searching for a solution..." : "Submit ticket"}
+                </button>
+              </div>
+              {formError && (
+                <p className="text-sm text-[#C7838B]">{formError}</p>
+              )}
+            </form>
+
+            {result && (
+              <div className="mt-6 max-w-2xl border border-[#594438] p-4">
+                {result.suggestion ? (
+                  <>
+                    <p className="text-[10px] uppercase tracking-[0.2em] text-[#9E8B7A]">
+                      Suggested solution ·{" "}
+                      {Math.round(result.suggestion.similarity * 100)}% match
+                    </p>
+                    <p className="mt-2 text-sm leading-6">
+                      {result.suggestion.solution}
+                    </p>
+                  </>
+                ) : (
+                  <p className="text-sm">
+                    No close match found. Your ticket was routed to an agent.
+                  </p>
+                )}
+              </div>
+            )}
+          </section>
+        )}
 
         <section
           aria-label="Ticket statistics"
