@@ -1,42 +1,69 @@
 "use client";
 
-import { useEffect, useMemo, useState, type FormEvent } from "react";
+import {
+  useCallback,
+  useEffect,
+  useMemo,
+  useState,
+  type FormEvent,
+} from "react";
 
-type Ticket = {
-  id: number;
-  title: string;
-  category: string;
-  priority: string;
-  status: string;
-  created_at: string;
-};
+type Role = "customer" | "agent" | "admin";
+type User = { id: number; name: string; email: string; role: Role };
 
 type ApiTicket = {
   id: number;
+  customer_id: number | null;
+  assigned_agent_id: number | null;
   title: string;
-  priority: string | null;
+  description: string;
   status: string;
+  priority: string | null;
+  sla_due_at: string | null;
   created_at: string;
+  sla_breached: boolean | null;
 };
 
-const stats = [
-  { label: "TOTAL TICKETS", value: "248", note: "+12 this week" },
-  { label: "OPEN", value: "042", note: "Needs attention" },
-  { label: "RESOLVED", value: "186", note: "This month" },
-  { label: "DEFLECTED", value: "064", note: "Solutions found" },
-];
+type Ticket = {
+  id: number;
+  customer_id: number | null;
+  assigned_agent_id: number | null;
+  title: string;
+  description: string;
+  status: string; // raw, e.g. "in_progress"
+  priority: string; // display, e.g. "High"
+  sla_due_at: string | null;
+  created_at: string;
+  sla_breached: boolean;
+};
 
-const activity = [
-  { day: "MON", value: 45 },
-  { day: "TUE", value: 70 },
-  { day: "WED", value: 55 },
-  { day: "THU", value: 90 },
-  { day: "FRI", value: 65 },
-  { day: "SAT", value: 35 },
-  { day: "SUN", value: 50 },
-];
+type Solution = {
+  id: number;
+  ticket_id: number;
+  title: string;
+  solution_text: string;
+  created_at: string;
+  agent_name: string | null;
+};
 
-const navItems = [
+type Analytics = {
+  total_tickets: number;
+  deflected: number;
+  suggestions: number;
+  accepted: number;
+  rejected: number;
+  avg_similarity: number | null;
+  sla_breached: number;
+};
+
+type SubmitResult = {
+  suggestion: { id: number; similarity: number; solution: string } | null;
+  routedToAgent: boolean;
+};
+
+const FINISHED = ["resolved", "closed", "deflected"];
+
+const allNavItems = [
   { label: "Overview", number: "01" },
   { label: "All tickets", number: "02" },
   { label: "Solutions", number: "03" },
@@ -59,18 +86,384 @@ function formatTicketId(id: number) {
   return `TKT-${String(id).padStart(4, "0")}`;
 }
 
+function formatDate(iso: string | null) {
+  return iso ? new Date(iso).toLocaleString() : "—";
+}
+
 function toTicket(t: ApiTicket): Ticket {
   return {
     id: t.id,
+    customer_id: t.customer_id ?? null,
+    assigned_agent_id: t.assigned_agent_id ?? null,
     title: t.title,
-    category: "Uncategorized",
+    description: t.description,
+    status: t.status,
     priority: formatPriority(t.priority),
-    status: formatStatus(t.status),
+    sla_due_at: t.sla_due_at ?? null,
     created_at: t.created_at,
+    sla_breached: Boolean(t.sla_breached),
   };
 }
 
+function statusClass(status: string) {
+  if (status === "resolved" || status === "closed") return "text-[#8FB29B]";
+  if (status === "deflected") return "text-[#9E8B7A]";
+  if (status === "in_progress" || status === "assigned")
+    return "text-[#C9AE86]";
+  return "text-[#C7838B]";
+}
+
+function pad(n: number) {
+  return String(n).padStart(3, "0");
+}
+
+/* ---------- Small presentational pieces ---------- */
+
+function Metric({
+  label,
+  value,
+  note,
+  index,
+}: {
+  label: string;
+  value: string;
+  note: string;
+  index: number;
+}) {
+  return (
+    <article
+      className={`py-6 ${index % 2 === 0 ? "pr-4" : "pl-4"} ${
+        index > 0 ? "sm:border-l sm:border-[#594438] sm:px-5" : ""
+      } ${index < 2 ? "border-b border-[#594438] sm:border-b-0" : ""}`}
+    >
+      <p className="text-[10px] font-semibold tracking-[0.14em] text-[#9E8B7A]">
+        {label}
+      </p>
+      <p className="mt-3 text-4xl font-bold tracking-tight md:text-5xl">
+        {value}
+      </p>
+      <p className="mt-2 text-xs text-[#B8A697]">{note}</p>
+    </article>
+  );
+}
+
+function Bar({
+  label,
+  value,
+  total,
+  color,
+}: {
+  label: string;
+  value: number;
+  total: number;
+  color: string;
+}) {
+  const pct = total > 0 ? Math.round((value / total) * 100) : 0;
+  return (
+    <div>
+      <div className="mb-2 flex items-center justify-between text-sm">
+        <span className="text-[#B8A697]">{label}</span>
+        <span className="font-semibold">
+          {value} <span className="text-[#9E8B7A]">· {pct}%</span>
+        </span>
+      </div>
+      <div className="h-1 bg-[#594438]">
+        <div
+          className="h-full"
+          style={{ width: `${pct}%`, backgroundColor: color }}
+        />
+      </div>
+    </div>
+  );
+}
+
+function TicketTable({
+  rows,
+  loading,
+  error,
+  emptyText,
+  onOpen,
+}: {
+  rows: Ticket[];
+  loading: boolean;
+  error: string;
+  emptyText: string;
+  onOpen: (id: number) => void;
+}) {
+  return (
+    <div className="overflow-x-auto">
+      <table className="w-full min-w-[680px] text-left text-sm">
+        <thead>
+          <tr className="border-b border-[#594438] text-[10px] uppercase tracking-[0.15em] text-[#9E8B7A]">
+            <th className="py-4 pr-4 font-medium">Reference</th>
+            <th className="px-4 py-4 font-medium">Subject</th>
+            <th className="px-4 py-4 font-medium">SLA due</th>
+            <th className="px-4 py-4 font-medium">Priority</th>
+            <th className="px-4 py-4 font-medium">Status</th>
+          </tr>
+        </thead>
+        <tbody>
+          {loading && (
+            <tr>
+              <td
+                colSpan={5}
+                className="py-12 text-center text-sm text-[#9E8B7A]"
+              >
+                Loading tickets...
+              </td>
+            </tr>
+          )}
+
+          {!loading && error && (
+            <tr>
+              <td
+                colSpan={5}
+                className="py-12 text-center text-sm text-[#C7838B]"
+              >
+                {error}
+              </td>
+            </tr>
+          )}
+
+          {!loading &&
+            !error &&
+            rows.map((ticket) => (
+              <tr
+                key={ticket.id}
+                tabIndex={0}
+                onClick={() => onOpen(ticket.id)}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter") onOpen(ticket.id);
+                }}
+                className="cursor-pointer border-b border-[#453025] transition-colors hover:bg-[#38251B] focus:bg-[#38251B] focus:outline-none"
+              >
+                <td className="py-5 pr-4 font-mono text-xs text-[#9E8B7A]">
+                  {formatTicketId(ticket.id)}
+                </td>
+                <td className="max-w-[300px] whitespace-normal px-4 py-5 font-medium text-[#F5F0E8]">
+                  {ticket.title}
+                </td>
+                <td className="px-4 py-5 text-xs text-[#B8A697]">
+                  {FINISHED.includes(ticket.status) ? (
+                    "—"
+                  ) : (
+                    <>
+                      {formatDate(ticket.sla_due_at)}
+                      {ticket.sla_breached && (
+                        <span className="ml-2 font-semibold text-[#C7838B]">
+                          Overdue
+                        </span>
+                      )}
+                    </>
+                  )}
+                </td>
+                <td className="px-4 py-5">
+                  <span
+                    className={
+                      ticket.priority === "Urgent" ||
+                      ticket.priority === "High"
+                        ? "font-semibold text-[#C7838B]"
+                        : "text-[#B8A697]"
+                    }
+                  >
+                    {ticket.priority}
+                  </span>
+                </td>
+                <td className="px-4 py-5">
+                  <span className={statusClass(ticket.status)}>
+                    {formatStatus(ticket.status)}
+                  </span>
+                </td>
+              </tr>
+            ))}
+
+          {!loading && !error && rows.length === 0 && (
+            <tr>
+              <td
+                colSpan={5}
+                className="py-12 text-center text-sm text-[#9E8B7A]"
+              >
+                {emptyText}
+              </td>
+            </tr>
+          )}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
+function TicketPanel({
+  ticket,
+  solution,
+  user,
+  onClose,
+  onResolved,
+}: {
+  ticket: Ticket;
+  solution: Solution | undefined;
+  user: User | null;
+  onClose: () => void;
+  onResolved: () => void;
+}) {
+  const [text, setText] = useState("");
+  const [saving, setSaving] = useState(false);
+  const [err, setErr] = useState("");
+
+  const finished = FINISHED.includes(ticket.status);
+  const isStaff = user?.role === "agent" || user?.role === "admin";
+  const canResolve =
+    !finished &&
+    !!user &&
+    (user.role === "admin" ||
+      (user.role === "agent" && ticket.assigned_agent_id === user.id));
+
+  async function resolve(e: FormEvent) {
+    e.preventDefault();
+    setSaving(true);
+    setErr("");
+    try {
+      const res = await fetch(`/api/tickets/${ticket.id}/resolve`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ solution: text }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || "Could not resolve ticket");
+      setText("");
+      onResolved();
+    } catch (e2) {
+      setErr(e2 instanceof Error ? e2.message : "Could not resolve ticket");
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  return (
+    <div className="fixed inset-0 z-50 flex justify-end">
+      <button
+        type="button"
+        aria-label="Close ticket"
+        onClick={onClose}
+        className="absolute inset-0 bg-black/50"
+      />
+      <aside className="relative h-full w-full max-w-md overflow-y-auto border-l border-[#594438] bg-[#2C1A0E] p-6 text-[#F5F0E8]">
+        <div className="flex items-start justify-between gap-4">
+          <p className="font-mono text-xs text-[#9E8B7A]">
+            {formatTicketId(ticket.id)}
+          </p>
+          <button
+            type="button"
+            onClick={onClose}
+            className="text-sm text-[#B8A697] hover:text-[#F5F0E8]"
+          >
+            Close
+          </button>
+        </div>
+
+        <h2 className="mt-4 text-2xl font-bold leading-tight">
+          {ticket.title}
+        </h2>
+
+        <dl className="mt-6 grid grid-cols-2 gap-4 border-y border-[#594438] py-4 text-sm">
+          <div>
+            <dt className="text-[10px] uppercase tracking-[0.15em] text-[#9E8B7A]">
+              Status
+            </dt>
+            <dd className={`mt-1 ${statusClass(ticket.status)}`}>
+              {formatStatus(ticket.status)}
+            </dd>
+          </div>
+          <div>
+            <dt className="text-[10px] uppercase tracking-[0.15em] text-[#9E8B7A]">
+              Priority
+            </dt>
+            <dd className="mt-1">{ticket.priority}</dd>
+          </div>
+          <div>
+            <dt className="text-[10px] uppercase tracking-[0.15em] text-[#9E8B7A]">
+              Created
+            </dt>
+            <dd className="mt-1 text-xs">{formatDate(ticket.created_at)}</dd>
+          </div>
+          <div>
+            <dt className="text-[10px] uppercase tracking-[0.15em] text-[#9E8B7A]">
+              SLA due
+            </dt>
+            <dd className="mt-1 text-xs">
+              {finished ? "—" : formatDate(ticket.sla_due_at)}
+              {!finished && ticket.sla_breached && (
+                <span className="ml-2 font-semibold text-[#C7838B]">
+                  Overdue
+                </span>
+              )}
+            </dd>
+          </div>
+        </dl>
+
+        <p className="mt-6 text-[10px] uppercase tracking-[0.2em] text-[#9E8B7A]">
+          Description
+        </p>
+        <p className="mt-2 whitespace-pre-wrap text-sm leading-6 text-[#D9CBB9]">
+          {ticket.description}
+        </p>
+
+        {solution && (
+          <div className="mt-6 border border-[#594438] p-4">
+            <p className="text-[10px] uppercase tracking-[0.2em] text-[#9E8B7A]">
+              Solution
+              {solution.agent_name ? ` · ${solution.agent_name}` : ""}
+            </p>
+            <p className="mt-2 whitespace-pre-wrap text-sm leading-6">
+              {solution.solution_text}
+            </p>
+          </div>
+        )}
+
+        {ticket.status === "deflected" && (
+          <p className="mt-6 text-sm text-[#B8A697]">
+            The customer accepted a suggested solution, so no agent was needed.
+          </p>
+        )}
+
+        {canResolve && (
+          <form onSubmit={resolve} className="mt-6 space-y-3">
+            <p className="text-[10px] uppercase tracking-[0.2em] text-[#9E8B7A]">
+              Resolve this ticket
+            </p>
+            <textarea
+              value={text}
+              onChange={(e) => setText(e.target.value)}
+              placeholder="Write the solution. It will be suggested to future customers with similar problems."
+              required
+              rows={5}
+              className="w-full border border-[#594438] bg-transparent px-3 py-2 text-sm text-[#F5F0E8] outline-none placeholder:text-[#9E8B7A]"
+            />
+            <button
+              type="submit"
+              disabled={saving}
+              className="bg-[#2A4A3A] px-5 py-3 text-sm font-semibold text-[#F5F0E8] disabled:opacity-50"
+            >
+              {saving ? "Saving..." : "Resolve ticket"}
+            </button>
+            {err && <p className="text-sm text-[#C7838B]">{err}</p>}
+          </form>
+        )}
+
+        {!canResolve && !finished && isStaff && (
+          <p className="mt-6 text-sm text-[#B8A697]">
+            Only the assigned agent (or an admin) can resolve this ticket.
+          </p>
+        )}
+      </aside>
+    </div>
+  );
+}
+
+/* ---------- Page ---------- */
+
 export default function Home() {
+  const [user, setUser] = useState<User | null>(null);
   const [activeNav, setActiveNav] = useState("Overview");
   const [search, setSearch] = useState("");
   const [statusFilter, setStatusFilter] = useState("All statuses");
@@ -80,22 +473,105 @@ export default function Home() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
 
+  const [solutions, setSolutions] = useState<Solution[]>([]);
+  const [solutionSearch, setSolutionSearch] = useState("");
+
+  const [analytics, setAnalytics] = useState<Analytics | null>(null);
+  const [analyticsError, setAnalyticsError] = useState("");
+
+  const [selectedId, setSelectedId] = useState<number | null>(null);
+
+  // Read the clock only in the browser (inside an effect), never during prerender.
+  const [now, setNow] = useState<number | null>(null);
+  useEffect(() => {
+    setNow(Date.now());
+  }, []);
+
   const [showForm, setShowForm] = useState(false);
   const [newTitle, setNewTitle] = useState("");
   const [newDescription, setNewDescription] = useState("");
   const [newPriority, setNewPriority] = useState("medium");
   const [submitting, setSubmitting] = useState(false);
   const [formError, setFormError] = useState("");
-  const [result, setResult] = useState<{
-    suggestion: { id: number; similarity: number; solution: string } | null;
-    routedToAgent: boolean;
-  } | null>(null);
+  const [result, setResult] = useState<SubmitResult | null>(null);
+  const [feedback, setFeedback] = useState<
+    "idle" | "sending" | "accepted" | "rejected"
+  >("idle");
+  const [feedbackError, setFeedbackError] = useState("");
+
+  const loadTickets = useCallback(async () => {
+    try {
+      const response = await fetch("/api/tickets");
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.error || "Failed to load tickets");
+      if (!Array.isArray(data.tickets)) {
+        throw new Error("Unexpected response from the ticket API");
+      }
+      setTickets((data.tickets as ApiTicket[]).map(toTicket));
+      setError("");
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Failed to load tickets");
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  const loadSolutions = useCallback(async () => {
+    try {
+      const response = await fetch("/api/solutions");
+      const data = await response.json();
+      if (response.ok && Array.isArray(data.solutions)) {
+        setSolutions(data.solutions as Solution[]);
+      }
+    } catch {
+      /* the Solutions view just stays empty */
+    }
+  }, []);
+
+  useEffect(() => {
+    async function loadUser() {
+      try {
+        const res = await fetch("/api/auth/me");
+        if (!res.ok) {
+          window.location.href = "/login";
+          return;
+        }
+        const data = await res.json();
+        setUser(data.user as User);
+      } catch {
+        window.location.href = "/login";
+      }
+    }
+    loadUser();
+    loadTickets();
+    loadSolutions();
+  }, [loadTickets, loadSolutions]);
+
+  useEffect(() => {
+    if (activeNav !== "Analytics") return;
+    async function loadAnalytics() {
+      try {
+        const res = await fetch("/api/analytics");
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.error || "Failed to load analytics");
+        setAnalytics(data.analytics as Analytics);
+        setAnalyticsError("");
+      } catch (err) {
+        setAnalyticsError(
+          err instanceof Error ? err.message : "Failed to load analytics"
+        );
+      }
+    }
+    loadAnalytics();
+  }, [activeNav, tickets]);
 
   async function submitTicket(e: FormEvent) {
     e.preventDefault();
     setSubmitting(true);
     setFormError("");
     setResult(null);
+    setFeedback("idle");
+    setFeedbackError("");
     try {
       const res = await fetch("/api/tickets", {
         method: "POST",
@@ -108,13 +584,13 @@ export default function Home() {
       });
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || "Failed to create ticket");
-      setTickets((prev) => [toTicket(data.ticket), ...prev]);
       setResult({
         suggestion: data.suggestion,
         routedToAgent: data.routedToAgent,
       });
       setNewTitle("");
       setNewDescription("");
+      await loadTickets();
     } catch (err) {
       setFormError(
         err instanceof Error ? err.message : "Failed to create ticket"
@@ -124,79 +600,213 @@ export default function Home() {
     }
   }
 
+  async function sendFeedback(accepted: boolean) {
+    if (!result?.suggestion) return;
+    setFeedback("sending");
+    setFeedbackError("");
+    try {
+      const res = await fetch(
+        `/api/suggestions/${result.suggestion.id}/feedback`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ accepted }),
+        }
+      );
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || "Could not save feedback");
+      setFeedback(accepted ? "accepted" : "rejected");
+      await loadTickets();
+    } catch (err) {
+      setFeedback("idle");
+      setFeedbackError(
+        err instanceof Error ? err.message : "Could not save feedback"
+      );
+    }
+  }
+
   async function logout() {
     await fetch("/api/auth/logout", { method: "POST" });
     window.location.href = "/login";
   }
 
-  useEffect(() => {
-    let cancelled = false;
+  async function handleResolved() {
+    await Promise.all([loadTickets(), loadSolutions()]);
+  }
 
-    async function loadTickets() {
-      try {
-        const response = await fetch("/api/tickets");
-        const data = await response.json();
-
-        if (!response.ok) {
-          throw new Error(data.error || "Failed to load tickets");
-        }
-
-        if (!Array.isArray(data.tickets)) {
-          throw new Error("Unexpected response from the ticket API");
-        }
-
-        const loadedTickets: Ticket[] = (data.tickets as ApiTicket[]).map(
-          toTicket
-        );
-
-        if (!cancelled) {
-          setTickets(loadedTickets);
-          setError("");
-        }
-      } catch (err) {
-        if (!cancelled) {
-          setError(
-            err instanceof Error ? err.message : "Failed to load tickets"
-          );
-        }
-      } finally {
-        if (!cancelled) {
-          setLoading(false);
-        }
-      }
-    }
-
-    loadTickets();
-
-    return () => {
-      cancelled = true;
-    };
-  }, []);
+  const navItems = useMemo(
+    () =>
+      allNavItems.filter(
+        (item) => item.label !== "Analytics" || user?.role !== "customer"
+      ),
+    [user]
+  );
 
   const filteredTickets = useMemo(() => {
-    const query = search.trim().toLowerCase();
-
+    const q = search.trim().toLowerCase();
     return tickets.filter((ticket) => {
+      const statusLabel = formatStatus(ticket.status);
       const matchesSearch =
-        !query ||
+        !q ||
         [
           formatTicketId(ticket.id),
           ticket.title,
-          ticket.category,
           ticket.priority,
-          ticket.status,
-        ].some((value) => value.toLowerCase().includes(query));
-
+          statusLabel,
+        ].some((value) => value.toLowerCase().includes(q));
       const matchesStatus =
-        statusFilter === "All statuses" || ticket.status === statusFilter;
-
+        statusFilter === "All statuses" || statusLabel === statusFilter;
       const matchesPriority =
         priorityFilter === "All priorities" ||
         ticket.priority === priorityFilter;
-
       return matchesSearch && matchesStatus && matchesPriority;
     });
   }, [tickets, search, statusFilter, priorityFilter]);
+
+  const counts = useMemo(() => {
+    const open = tickets.filter((t) =>
+      ["open", "assigned", "in_progress"].includes(t.status)
+    ).length;
+    const resolved = tickets.filter((t) =>
+      ["resolved", "closed"].includes(t.status)
+    ).length;
+    const deflected = tickets.filter((t) => t.status === "deflected").length;
+    const breached = tickets.filter(
+      (t) => t.sla_breached && !FINISHED.includes(t.status)
+    ).length;
+    const weekAgo = now === null ? 0 : now - 7 * 24 * 60 * 60 * 1000;
+    const lastWeek =
+      now === null
+        ? 0
+        : tickets.filter((t) => new Date(t.created_at).getTime() >= weekAgo)
+            .length;
+    return {
+      total: tickets.length,
+      open,
+      resolved,
+      deflected,
+      breached,
+      lastWeek,
+    };
+  }, [tickets, now]);
+
+  const volume = useMemo(() => {
+    if (now === null) return [];
+    const days: { date: number; label: string; count: number }[] = [];
+    for (let i = 6; i >= 0; i--) {
+      const d = new Date(now);
+      d.setHours(0, 0, 0, 0);
+      d.setDate(d.getDate() - i);
+      days.push({
+        date: d.getTime(),
+        label: d
+          .toLocaleDateString("en-US", { weekday: "short" })
+          .toUpperCase(),
+        count: 0,
+      });
+    }
+    tickets.forEach((t) => {
+      const c = new Date(t.created_at);
+      c.setHours(0, 0, 0, 0);
+      const slot = days.find((d) => d.date === c.getTime());
+      if (slot) slot.count += 1;
+    });
+    const max = Math.max(1, ...days.map((d) => d.count));
+    return days.map((d) => ({
+      ...d,
+      pct: Math.max(2, Math.round((d.count / max) * 100)),
+      isMax: d.count === max && d.count > 0,
+    }));
+  }, [tickets, now]);
+
+  const filteredSolutions = useMemo(() => {
+    const q = solutionSearch.trim().toLowerCase();
+    return solutions.filter(
+      (s) =>
+        !q ||
+        s.title.toLowerCase().includes(q) ||
+        s.solution_text.toLowerCase().includes(q)
+    );
+  }, [solutions, solutionSearch]);
+
+  const solutionByTicket = useMemo(() => {
+    const map = new Map<number, Solution>();
+    solutions.forEach((s) => map.set(s.ticket_id, s));
+    return map;
+  }, [solutions]);
+
+  const selected = tickets.find((t) => t.id === selectedId) ?? null;
+  const isCustomer = user?.role === "customer";
+  const recent = filteredTickets.slice(0, 8);
+
+  const statCards = [
+    {
+      label: "TOTAL TICKETS",
+      value: pad(counts.total),
+      note: `${counts.lastWeek} in the last 7 days`,
+    },
+    {
+      label: "OPEN",
+      value: pad(counts.open),
+      note: counts.breached
+        ? `${counts.breached} past SLA`
+        : "Needs attention",
+    },
+    {
+      label: "RESOLVED",
+      value: pad(counts.resolved),
+      note: "Closed by an agent",
+    },
+    {
+      label: "DEFLECTED",
+      value: pad(counts.deflected),
+      note: "Solutions accepted",
+    },
+  ];
+
+  const filters = (
+    <div className="mt-6 grid gap-3 border-y border-[#594438] py-4 md:grid-cols-[minmax(200px,1fr)_180px_180px]">
+      <label className="flex min-w-0 items-center gap-3 border-b border-[#594438] pb-3 md:border-b-0 md:pb-0">
+        <span className="text-[#9E8B7A]">⌕</span>
+        <input
+          type="search"
+          value={search}
+          onChange={(event) => setSearch(event.target.value)}
+          placeholder="Search tickets, subjects, status..."
+          aria-label="Search tickets"
+          className="min-w-0 flex-1 bg-transparent py-2 text-sm text-[#F5F0E8] outline-none placeholder:text-[#9E8B7A]"
+        />
+      </label>
+
+      <select
+        value={statusFilter}
+        onChange={(event) => setStatusFilter(event.target.value)}
+        aria-label="Filter by status"
+        className="border-b border-[#594438] bg-[#2C1A0E] py-3 text-sm text-[#F5F0E8] outline-none md:border-b-0 md:border-l md:pl-4"
+      >
+        <option>All statuses</option>
+        <option>Open</option>
+        <option>Deflected</option>
+        <option>Assigned</option>
+        <option>In Progress</option>
+        <option>Resolved</option>
+        <option>Closed</option>
+      </select>
+
+      <select
+        value={priorityFilter}
+        onChange={(event) => setPriorityFilter(event.target.value)}
+        aria-label="Filter by priority"
+        className="border-b border-[#594438] bg-[#2C1A0E] py-3 text-sm text-[#F5F0E8] outline-none md:border-b-0 md:border-l md:pl-4"
+      >
+        <option>All priorities</option>
+        <option>Urgent</option>
+        <option>High</option>
+        <option>Medium</option>
+        <option>Low</option>
+      </select>
+    </div>
+  );
 
   return (
     <main className="min-h-screen md:flex">
@@ -253,17 +863,16 @@ export default function Home() {
           <div className="mt-4 h-1 w-full bg-[#594438]">
             <div className="h-full w-2/3 bg-[#2A4A3A]" />
           </div>
-          <p className="mt-2 text-[10px] text-[#9E8B7A]">
-            Semantic resolution · Preview
-          </p>
         </div>
 
         <div className="mt-8 border-t border-[#594438] pt-5 md:mt-auto md:pt-6">
           <p className="text-[10px] uppercase tracking-[0.2em] text-[#9E8B7A]">
-            Environment
+            Signed in
           </p>
-          <p className="mt-2 text-sm">Development workspace</p>
-          <p className="mt-1 text-xs text-[#9E8B7A]">Frontend preview</p>
+          <p className="mt-2 text-sm">{user ? user.name : "…"}</p>
+          <p className="mt-1 text-xs capitalize text-[#9E8B7A]">
+            {user ? user.role : ""}
+          </p>
         </div>
       </aside>
 
@@ -274,32 +883,54 @@ export default function Home() {
               Support operations / {activeNav}
             </p>
 
-            <h1 className="mt-5 text-4xl font-bold leading-[1.06] tracking-tight md:text-5xl lg:text-6xl">
-              Find the pattern.
-              <br />
-              <span className="font-normal text-[#9E8B7A]">
-                Resolve it once.
-              </span>
-            </h1>
-
-            <p className="mt-5 max-w-lg text-sm leading-6 text-[#B8A697]">
-              A clearer view of incoming issues, recurring problems, and
-              opportunities for automated resolution.
-            </p>
+            {activeNav === "Overview" ? (
+              <>
+                <h1 className="mt-5 text-4xl font-bold leading-[1.06] tracking-tight md:text-5xl lg:text-6xl">
+                  Find the pattern.
+                  <br />
+                  <span className="font-normal text-[#9E8B7A]">
+                    Resolve it once.
+                  </span>
+                </h1>
+                <p className="mt-5 max-w-lg text-sm leading-6 text-[#B8A697]">
+                  A clearer view of incoming issues, recurring problems, and
+                  opportunities for automated resolution.
+                </p>
+              </>
+            ) : (
+              <>
+                <h1 className="mt-5 text-3xl font-bold tracking-tight md:text-4xl">
+                  {activeNav}
+                </h1>
+                <p className="mt-3 max-w-lg text-sm leading-6 text-[#B8A697]">
+                  {activeNav === "All tickets" &&
+                    (isCustomer
+                      ? "Every ticket you have submitted. Select one to see its details."
+                      : "Select a ticket to read it and, if it is yours, resolve it.")}
+                  {activeNav === "Solutions" &&
+                    "Solutions from resolved tickets. These are what customers see as suggestions."}
+                  {activeNav === "Analytics" &&
+                    "How well suggested solutions are deflecting tickets."}
+                </p>
+              </>
+            )}
           </div>
 
           <div className="flex gap-3">
-            <button
-              type="button"
-              onClick={() => {
-                setShowForm((v) => !v);
-                setResult(null);
-                setFormError("");
-              }}
-              className="bg-[#2A4A3A] px-5 py-3 text-sm font-semibold text-[#F5F0E8] transition hover:bg-[#355D49]"
-            >
-              {showForm ? "Close" : "+ New ticket"}
-            </button>
+            {isCustomer && (
+              <button
+                type="button"
+                onClick={() => {
+                  setShowForm((v) => !v);
+                  setResult(null);
+                  setFormError("");
+                  setFeedback("idle");
+                }}
+                className="bg-[#2A4A3A] px-5 py-3 text-sm font-semibold text-[#F5F0E8] transition hover:bg-[#355D49]"
+              >
+                {showForm ? "Close" : "+ New ticket"}
+              </button>
+            )}
             <button
               type="button"
               onClick={logout}
@@ -310,7 +941,7 @@ export default function Home() {
           </div>
         </header>
 
-        {showForm && (
+        {showForm && isCustomer && (
           <section className="border-b border-[#594438] py-7">
             <form onSubmit={submitTicket} className="max-w-2xl space-y-4">
               <input
@@ -331,11 +962,13 @@ export default function Home() {
               <select
                 value={newPriority}
                 onChange={(e) => setNewPriority(e.target.value)}
+                aria-label="Priority"
                 className="border border-[#594438] bg-[#2C1A0E] px-3 py-2 text-sm text-[#F5F0E8]"
               >
                 <option value="low">Low</option>
                 <option value="medium">Medium</option>
                 <option value="high">High</option>
+                <option value="urgent">Urgent</option>
               </select>
               <div>
                 <button
@@ -359,9 +992,49 @@ export default function Home() {
                       Suggested solution ·{" "}
                       {Math.round(result.suggestion.similarity * 100)}% match
                     </p>
-                    <p className="mt-2 text-sm leading-6">
+                    <p className="mt-2 whitespace-pre-wrap text-sm leading-6">
                       {result.suggestion.solution}
                     </p>
+
+                    {feedback === "accepted" && (
+                      <p className="mt-4 text-sm text-[#8FB29B]">
+                        Glad that helped. Your ticket is marked as deflected.
+                      </p>
+                    )}
+                    {feedback === "rejected" && (
+                      <p className="mt-4 text-sm text-[#C9AE86]">
+                        Sorry that did not help. Your ticket was assigned to an
+                        agent.
+                      </p>
+                    )}
+                    {(feedback === "idle" || feedback === "sending") && (
+                      <div className="mt-4 flex flex-wrap items-center gap-3">
+                        <span className="text-sm text-[#B8A697]">
+                          Did this solve your problem?
+                        </span>
+                        <button
+                          type="button"
+                          disabled={feedback === "sending"}
+                          onClick={() => sendFeedback(true)}
+                          className="bg-[#2A4A3A] px-4 py-2 text-sm font-semibold text-[#F5F0E8] disabled:opacity-50"
+                        >
+                          Yes, it did
+                        </button>
+                        <button
+                          type="button"
+                          disabled={feedback === "sending"}
+                          onClick={() => sendFeedback(false)}
+                          className="border border-[#594438] px-4 py-2 text-sm font-semibold text-[#B8A697] hover:bg-[#38251B] disabled:opacity-50"
+                        >
+                          No, send to an agent
+                        </button>
+                      </div>
+                    )}
+                    {feedbackError && (
+                      <p className="mt-3 text-sm text-[#C7838B]">
+                        {feedbackError}
+                      </p>
+                    )}
                   </>
                 ) : (
                   <p className="text-sm">
@@ -373,106 +1046,94 @@ export default function Home() {
           </section>
         )}
 
-        <section
-          aria-label="Ticket statistics"
-          className="grid grid-cols-2 border-b border-[#594438] sm:grid-cols-4"
-        >
-          {stats.map((stat, index) => (
-            <article
-              key={stat.label}
-              className={`py-6 ${
-                index % 2 === 0 ? "pr-4" : "pl-4"
-              } ${
-                index > 0 ? "sm:border-l sm:border-[#594438] sm:px-5" : ""
-              } ${
-                index < 2 ? "border-b border-[#594438] sm:border-b-0" : ""
-              }`}
+        {activeNav === "Overview" && (
+          <>
+            <section
+              aria-label="Ticket statistics"
+              className="grid grid-cols-2 border-b border-[#594438] sm:grid-cols-4"
             >
-              <p className="text-[10px] font-semibold tracking-[0.14em] text-[#9E8B7A]">
-                {stat.label}
-              </p>
-              <p className="mt-3 text-4xl font-bold tracking-tight md:text-5xl">
-                {stat.value}
-              </p>
-              <p className="mt-2 text-xs text-[#B8A697]">{stat.note}</p>
-            </article>
-          ))}
-        </section>
+              {statCards.map((stat, index) => (
+                <Metric
+                  key={stat.label}
+                  index={index}
+                  label={stat.label}
+                  value={stat.value}
+                  note={stat.note}
+                />
+              ))}
+            </section>
 
-        <section className="grid border-b border-[#594438] lg:grid-cols-[1.5fr_1fr]">
-          <article className="py-7 lg:pr-8">
-            <div className="flex flex-wrap items-start justify-between gap-3">
-              <div>
-                <p className="text-[10px] uppercase tracking-[0.2em] text-[#9E8B7A]">
-                  01 / Activity
-                </p>
-                <h2 className="mt-2 text-xl font-bold">Ticket volume</h2>
-              </div>
-              <span className="text-[10px] uppercase tracking-widest text-[#9E8B7A]">
-                Illustrative data
-              </span>
-            </div>
-
-            <div className="mt-7 flex h-36 items-end gap-3 sm:gap-5">
-              {activity.map((item) => (
-                <div
-                  key={item.day}
-                  className="flex h-full min-w-0 flex-1 flex-col items-center justify-end gap-3"
-                >
-                  <div className="flex h-full w-full items-end">
-                    <div
-                      className={`w-full transition-colors ${
-                        item.day === "THU"
-                          ? "bg-[#6B1E2D]"
-                          : "bg-[#2A4A3A] hover:bg-[#426B54]"
-                      }`}
-                      style={{ height: `${item.value}%` }}
-                      title={`${item.day}: ${item.value}% sample activity`}
-                    />
+            <section className="grid border-b border-[#594438] lg:grid-cols-[1.5fr_1fr]">
+              <article className="py-7 lg:pr-8">
+                <div className="flex flex-wrap items-start justify-between gap-3">
+                  <div>
+                    <p className="text-[10px] uppercase tracking-[0.2em] text-[#9E8B7A]">
+                      01 / Activity
+                    </p>
+                    <h2 className="mt-2 text-xl font-bold">Ticket volume</h2>
                   </div>
-                  <span className="text-[9px] tracking-wider text-[#9E8B7A]">
-                    {item.day}
+                  <span className="text-[10px] uppercase tracking-widest text-[#9E8B7A]">
+                    Last 7 days
                   </span>
                 </div>
-              ))}
-            </div>
-          </article>
 
-          <article className="border-t border-[#594438] py-7 lg:border-l lg:border-t-0 lg:pl-8">
-            <p className="text-[10px] uppercase tracking-[0.2em] text-[#9E8B7A]">
-              02 / Resolution
-            </p>
-            <h2 className="mt-2 text-xl font-bold">Monthly outcomes</h2>
-
-            <div className="mt-7 space-y-5">
-              {[
-                { label: "Resolved", value: 75, color: "#2A4A3A" },
-                { label: "Open", value: 17, color: "#6B1E2D" },
-                { label: "Deflected", value: 26, color: "#9E8B7A" },
-              ].map((item) => (
-                <div key={item.label}>
-                  <div className="mb-2 flex items-center justify-between text-sm">
-                    <span className="text-[#B8A697]">{item.label}</span>
-                    <span className="font-semibold">{item.value}%</span>
-                  </div>
-                  <div className="h-1 bg-[#594438]">
+                <div className="mt-7 flex h-36 items-end gap-3 sm:gap-5">
+                  {volume.map((item) => (
                     <div
-                      className="h-full"
-                      style={{
-                        width: `${item.value}%`,
-                        backgroundColor: item.color,
-                      }}
-                    />
-                  </div>
+                      key={item.date}
+                      className="flex h-full min-w-0 flex-1 flex-col items-center justify-end gap-3"
+                    >
+                      <div className="flex h-full w-full items-end">
+                        <div
+                          className={`w-full transition-colors ${
+                            item.isMax
+                              ? "bg-[#6B1E2D]"
+                              : "bg-[#2A4A3A] hover:bg-[#426B54]"
+                          }`}
+                          style={{ height: `${item.pct}%` }}
+                          title={`${item.label}: ${item.count} ticket${
+                            item.count === 1 ? "" : "s"
+                          }`}
+                        />
+                      </div>
+                      <span className="text-[9px] tracking-wider text-[#9E8B7A]">
+                        {item.label}
+                      </span>
+                    </div>
+                  ))}
                 </div>
-              ))}
-            </div>
-          </article>
-        </section>
+              </article>
 
-        <section className="pt-8">
-          <div className="flex flex-wrap items-end justify-between gap-4">
-            <div>
+              <article className="border-t border-[#594438] py-7 lg:border-l lg:border-t-0 lg:pl-8">
+                <p className="text-[10px] uppercase tracking-[0.2em] text-[#9E8B7A]">
+                  02 / Resolution
+                </p>
+                <h2 className="mt-2 text-xl font-bold">Outcomes</h2>
+
+                <div className="mt-7 space-y-5">
+                  <Bar
+                    label="Resolved"
+                    value={counts.resolved}
+                    total={counts.total}
+                    color="#2A4A3A"
+                  />
+                  <Bar
+                    label="Open"
+                    value={counts.open}
+                    total={counts.total}
+                    color="#6B1E2D"
+                  />
+                  <Bar
+                    label="Deflected"
+                    value={counts.deflected}
+                    total={counts.total}
+                    color="#9E8B7A"
+                  />
+                </div>
+              </article>
+            </section>
+
+            <section className="pt-8">
               <p className="text-[10px] uppercase tracking-[0.2em] text-[#9E8B7A]">
                 03 / Queue
               </p>
@@ -480,158 +1141,212 @@ export default function Home() {
               <p className="mt-2 text-sm text-[#B8A697]">
                 {loading
                   ? "Loading tickets..."
-                  : `${filteredTickets.length} of ${tickets.length} tickets`}
+                  : `Showing ${recent.length} of ${tickets.length} tickets`}
               </p>
-            </div>
-          </div>
-
-          <div className="mt-6 grid gap-3 border-y border-[#594438] py-4 md:grid-cols-[minmax(200px,1fr)_180px_180px]">
-            <label className="flex min-w-0 items-center gap-3 border-b border-[#594438] pb-3 md:border-b-0 md:pb-0">
-              <span className="text-[#9E8B7A]">⌕</span>
-              <input
-                type="search"
-                value={search}
-                onChange={(event) => setSearch(event.target.value)}
-                placeholder="Search tickets, subjects, categories..."
-                aria-label="Search tickets"
-                className="min-w-0 flex-1 bg-transparent py-2 text-sm text-[#F5F0E8] outline-none placeholder:text-[#9E8B7A]"
+              {filters}
+              <TicketTable
+                rows={recent}
+                loading={loading}
+                error={error}
+                emptyText="No tickets match your search and filters."
+                onOpen={setSelectedId}
               />
-            </label>
+            </section>
+          </>
+        )}
 
-            <select
-              value={statusFilter}
-              onChange={(event) => setStatusFilter(event.target.value)}
-              aria-label="Filter by status"
-              className="border-b border-[#594438] bg-[#2C1A0E] py-3 text-sm text-[#F5F0E8] outline-none md:border-b-0 md:border-l md:pl-4"
-            >
-              <option>All statuses</option>
-              <option>Open</option>
-              <option>Deflected</option>
-              <option>Assigned</option>
-              <option>In Progress</option>
-              <option>Resolved</option>
-              <option>Closed</option>
-            </select>
+        {activeNav === "All tickets" && (
+          <section className="pt-8">
+            <p className="text-sm text-[#B8A697]">
+              {loading
+                ? "Loading tickets..."
+                : `${filteredTickets.length} of ${tickets.length} tickets`}
+            </p>
+            {filters}
+            <TicketTable
+              rows={filteredTickets}
+              loading={loading}
+              error={error}
+              emptyText={
+                isCustomer && tickets.length === 0
+                  ? "You have not submitted any tickets yet."
+                  : "No tickets match your search and filters."
+              }
+              onOpen={setSelectedId}
+            />
+          </section>
+        )}
 
-            <select
-              value={priorityFilter}
-              onChange={(event) => setPriorityFilter(event.target.value)}
-              aria-label="Filter by priority"
-              className="border-b border-[#594438] bg-[#2C1A0E] py-3 text-sm text-[#F5F0E8] outline-none md:border-b-0 md:border-l md:pl-4"
-            >
-              <option>All priorities</option>
-              <option>Critical</option>
-              <option>High</option>
-              <option>Medium</option>
-              <option>Low</option>
-            </select>
-          </div>
+        {activeNav === "Solutions" && (
+          <section className="pt-8">
+            <p className="text-sm text-[#B8A697]">
+              {filteredSolutions.length} of {solutions.length} solutions
+            </p>
+            <div className="mt-6 border-y border-[#594438] py-4">
+              <label className="flex items-center gap-3">
+                <span className="text-[#9E8B7A]">⌕</span>
+                <input
+                  type="search"
+                  value={solutionSearch}
+                  onChange={(e) => setSolutionSearch(e.target.value)}
+                  placeholder="Search solutions..."
+                  aria-label="Search solutions"
+                  className="min-w-0 flex-1 bg-transparent py-2 text-sm text-[#F5F0E8] outline-none placeholder:text-[#9E8B7A]"
+                />
+              </label>
+            </div>
 
-          <div className="overflow-x-auto">
-            <table className="w-full min-w-[680px] text-left text-sm">
-              <thead>
-                <tr className="border-b border-[#594438] text-[10px] uppercase tracking-[0.15em] text-[#9E8B7A]">
-                  <th className="py-4 pr-4 font-medium">Reference</th>
-                  <th className="px-4 py-4 font-medium">Subject</th>
-                  <th className="px-4 py-4 font-medium">Category</th>
-                  <th className="px-4 py-4 font-medium">Priority</th>
-                  <th className="px-4 py-4 font-medium">Status</th>
-                </tr>
-              </thead>
+            <div className="divide-y divide-[#453025]">
+              {filteredSolutions.map((s) => (
+                <article key={s.id} className="py-6">
+                  <p className="font-mono text-xs text-[#9E8B7A]">
+                    {formatTicketId(s.ticket_id)}
+                    {s.agent_name ? ` · ${s.agent_name}` : ""} ·{" "}
+                    {new Date(s.created_at).toLocaleDateString()}
+                  </p>
+                  <h3 className="mt-2 text-lg font-bold">{s.title}</h3>
+                  <p className="mt-2 max-w-2xl whitespace-pre-wrap text-sm leading-6 text-[#D9CBB9]">
+                    {s.solution_text}
+                  </p>
+                </article>
+              ))}
+              {filteredSolutions.length === 0 && (
+                <p className="py-12 text-center text-sm text-[#9E8B7A]">
+                  No solutions match your search.
+                </p>
+              )}
+            </div>
+          </section>
+        )}
 
-              <tbody>
-                {loading && (
-                  <tr>
-                    <td
-                      colSpan={5}
-                      className="py-12 text-center text-sm text-[#9E8B7A]"
-                    >
-                      Loading tickets...
-                    </td>
-                  </tr>
-                )}
+        {activeNav === "Analytics" && (
+          <section className="pt-2">
+            {analyticsError && (
+              <p className="py-8 text-sm text-[#C7838B]">{analyticsError}</p>
+            )}
+            {!analytics && !analyticsError && (
+              <p className="py-8 text-sm text-[#9E8B7A]">Loading analytics...</p>
+            )}
+            {analytics && (
+              <>
+                <div className="grid grid-cols-2 border-b border-[#594438] sm:grid-cols-4">
+                  <Metric
+                    index={0}
+                    label="SUGGESTIONS SHOWN"
+                    value={pad(analytics.suggestions)}
+                    note="Matches above the threshold"
+                  />
+                  <Metric
+                    index={1}
+                    label="ACCEPTANCE RATE"
+                    value={
+                      analytics.accepted + analytics.rejected > 0
+                        ? `${Math.round(
+                            (analytics.accepted /
+                              (analytics.accepted + analytics.rejected)) *
+                              100
+                          )}%`
+                        : "—"
+                    }
+                    note="Of suggestions with feedback"
+                  />
+                  <Metric
+                    index={2}
+                    label="AVG MATCH"
+                    value={
+                      analytics.avg_similarity === null
+                        ? "—"
+                        : `${Math.round(analytics.avg_similarity * 100)}%`
+                    }
+                    note="Similarity of shown suggestions"
+                  />
+                  <Metric
+                    index={3}
+                    label="PAST SLA"
+                    value={pad(analytics.sla_breached)}
+                    note="Unfinished and overdue"
+                  />
+                </div>
 
-                {!loading && error && (
-                  <tr>
-                    <td
-                      colSpan={5}
-                      className="py-12 text-center text-sm text-[#C7838B]"
-                    >
-                      {error}
-                    </td>
-                  </tr>
-                )}
+                <div className="grid gap-10 py-8 md:grid-cols-2">
+                  <article>
+                    <h2 className="text-xl font-bold">Suggestion outcomes</h2>
+                    <div className="mt-6 space-y-5">
+                      <Bar
+                        label="Accepted"
+                        value={analytics.accepted}
+                        total={analytics.suggestions}
+                        color="#2A4A3A"
+                      />
+                      <Bar
+                        label="Rejected"
+                        value={analytics.rejected}
+                        total={analytics.suggestions}
+                        color="#6B1E2D"
+                      />
+                      <Bar
+                        label="Awaiting feedback"
+                        value={Math.max(
+                          0,
+                          analytics.suggestions -
+                            analytics.accepted -
+                            analytics.rejected
+                        )}
+                        total={analytics.suggestions}
+                        color="#9E8B7A"
+                      />
+                    </div>
+                  </article>
 
-                {!loading &&
-                  !error &&
-                  filteredTickets.map((ticket) => (
-                    <tr
-                      key={ticket.id}
-                      className="border-b border-[#453025] transition-colors hover:bg-[#38251B]"
-                    >
-                      <td className="py-5 pr-4 font-mono text-xs text-[#9E8B7A]">
-                        {formatTicketId(ticket.id)}
-                      </td>
-                      <td className="max-w-[300px] whitespace-normal px-4 py-5 font-medium text-[#F5F0E8]">
-                        {ticket.title}
-                      </td>
-                      <td className="px-4 py-5 text-[#B8A697]">
-                        {ticket.category}
-                      </td>
-                      <td className="px-4 py-5">
-                        <span
-                          className={
-                            ticket.priority === "Critical" ||
-                            ticket.priority === "High"
-                              ? "font-semibold text-[#C7838B]"
-                              : "text-[#B8A697]"
+                  <article>
+                    <h2 className="text-xl font-bold">Tickets by status</h2>
+                    <div className="mt-6 space-y-5">
+                      {[
+                        "open",
+                        "assigned",
+                        "in_progress",
+                        "resolved",
+                        "closed",
+                        "deflected",
+                      ].map((s) => (
+                        <Bar
+                          key={s}
+                          label={formatStatus(s)}
+                          value={tickets.filter((t) => t.status === s).length}
+                          total={tickets.length}
+                          color={
+                            s === "resolved" || s === "closed"
+                              ? "#2A4A3A"
+                              : s === "deflected"
+                                ? "#9E8B7A"
+                                : "#6B1E2D"
                           }
-                        >
-                          {ticket.priority}
-                        </span>
-                      </td>
-                      <td className="px-4 py-5">
-                        <span
-                          className={
-                            ticket.status === "Resolved" ||
-                            ticket.status === "Closed"
-                              ? "text-[#8FB29B]"
-                              : ticket.status === "In Progress" ||
-                                  ticket.status === "Assigned"
-                                ? "text-[#C9AE86]"
-                                : "text-[#C7838B]"
-                          }
-                        >
-                          {ticket.status}
-                        </span>
-                      </td>
-                    </tr>
-                  ))}
-
-                {!loading && !error && filteredTickets.length === 0 && (
-                  <tr>
-                    <td
-                      colSpan={5}
-                      className="py-12 text-center text-sm text-[#9E8B7A]"
-                    >
-                      No tickets match your search and filters.
-                    </td>
-                  </tr>
-                )}
-              </tbody>
-            </table>
-          </div>
-
-          <p className="mt-5 text-[10px] uppercase tracking-[0.12em] text-[#9E8B7A]">
-            Ticket records · Live API data
-          </p>
-        </section>
+                        />
+                      ))}
+                    </div>
+                  </article>
+                </div>
+              </>
+            )}
+          </section>
+        )}
 
         <footer className="mt-12 flex flex-wrap justify-between gap-3 border-t border-[#594438] pt-5 text-[10px] uppercase tracking-[0.12em] text-[#9E8B7A]">
           <span>Resolve · Intelligent Support</span>
           <span>Built for better resolutions</span>
         </footer>
       </section>
+
+      {selected && (
+        <TicketPanel
+          key={selected.id}
+          ticket={selected}
+          solution={solutionByTicket.get(selected.id)}
+          user={user}
+          onClose={() => setSelectedId(null)}
+          onResolved={handleResolved}
+        />
+      )}
     </main>
   );
 }
