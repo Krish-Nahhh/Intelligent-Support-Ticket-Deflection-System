@@ -1,0 +1,33 @@
+services:
+  db:
+    image: pgvector/pgvector:pg16
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${DB_PASSWORD}
+      POSTGRES_DB: tickets
+    ports:
+      - "5434:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d tickets"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  app:
+    build: .
+    env_file: .env.local
+    environment:
+      DATABASE_URL: postgres://postgres:${DB_PASSWORD}@db:5432/tickets
+    ports:
+      - "3000:3000"
+    volumes:
+      - hfcache:/app/node_modules/@huggingface/transformers/.cache
+    depends_on:
+      db:
+        condition: service_healthy
+
+volumes:
+  pgdata:
+  hfcache:
