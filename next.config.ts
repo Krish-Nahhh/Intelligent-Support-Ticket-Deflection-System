@@ -1,7 +1,8 @@
 import type { NextConfig } from "next";
 
 const nextConfig: NextConfig = {
-  output:"standalone",
+  serverExternalPackages: ["@huggingface/transformers", "onnxruntime-node"],
+  output: "standalone",
   /* config options here */
   experimental: {
     agentFeedback: true,
