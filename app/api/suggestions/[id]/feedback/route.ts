@@ -48,7 +48,7 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
       );
     } else {
       // runs on the same connection, so it is part of the transaction
-      await assignAgent(s.ticket_id, (text, p) => client.query(text, p));
+      await assignAgent(s.ticket_id, (text: string, p?: any[]) => client.query(text, p));
     }
 
     await client.query("COMMIT");

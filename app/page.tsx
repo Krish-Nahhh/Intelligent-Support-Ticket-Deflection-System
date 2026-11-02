@@ -56,6 +56,15 @@ type Analytics = {
   sla_breached: number;
 };
 
+type AdminStats = {
+  total: number;
+  deflected: number;
+  sla_breached: number;
+  deflection_rate: number;
+};
+
+type WorkloadRow = { id: number; name: string; active_tickets: number };
+
 type SubmitResult = {
   suggestion: { id: number; similarity: number; solution: string } | null;
   routedToAgent: boolean;
@@ -299,16 +308,21 @@ function TicketPanel({
   user,
   onClose,
   onResolved,
+  onDeleted,
 }: {
   ticket: Ticket;
   solution: Solution | undefined;
   user: User | null;
   onClose: () => void;
   onResolved: () => void;
+  onDeleted: () => void;
 }) {
   const [text, setText] = useState("");
   const [saving, setSaving] = useState(false);
   const [err, setErr] = useState("");
+  const [confirmDelete, setConfirmDelete] = useState(false);
+  const [deleting, setDeleting] = useState(false);
+  const [deleteErr, setDeleteErr] = useState("");
 
   const finished = FINISHED.includes(ticket.status);
   const isStaff = user?.role === "agent" || user?.role === "admin";
@@ -317,6 +331,20 @@ function TicketPanel({
     !!user &&
     (user.role === "admin" ||
       (user.role === "agent" && ticket.assigned_agent_id === user.id));
+
+  async function deleteTicket() {
+    setDeleting(true);
+    setDeleteErr("");
+    try {
+      const res = await fetch(`/api/tickets/${ticket.id}`, { method: "DELETE" });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data.error || "Could not delete ticket");
+      onDeleted();
+    } catch (e2) {
+      setDeleteErr(e2 instanceof Error ? e2.message : "Could not delete ticket");
+      setDeleting(false);
+    }
+  }
 
   async function resolve(e: FormEvent) {
     e.preventDefault();
@@ -455,6 +483,51 @@ function TicketPanel({
             Only the assigned agent (or an admin) can resolve this ticket.
           </p>
         )}
+
+        {user?.role === "admin" && (
+          <div className="mt-8 border-t border-[#594438] pt-6">
+            <p className="text-[10px] uppercase tracking-[0.2em] text-[#9E8B7A]">
+              Admin actions
+            </p>
+            {!confirmDelete ? (
+              <button
+                type="button"
+                onClick={() => setConfirmDelete(true)}
+                className="mt-3 border border-[#6B1E2D] px-4 py-2 text-sm font-semibold text-[#C7838B] transition hover:bg-[#3A1A1F]"
+              >
+                Delete ticket
+              </button>
+            ) : (
+              <div className="mt-3 border border-[#6B1E2D] p-4">
+                <p className="text-sm leading-6 text-[#D9CBB9]">
+                  This permanently deletes the ticket together with its
+                  resolution and suggestions. It cannot be undone.
+                </p>
+                <div className="mt-3 flex gap-3">
+                  <button
+                    type="button"
+                    disabled={deleting}
+                    onClick={deleteTicket}
+                    className="bg-[#6B1E2D] px-4 py-2 text-sm font-semibold text-[#F5F0E8] disabled:opacity-50"
+                  >
+                    {deleting ? "Deleting..." : "Yes, delete permanently"}
+                  </button>
+                  <button
+                    type="button"
+                    disabled={deleting}
+                    onClick={() => setConfirmDelete(false)}
+                    className="border border-[#594438] px-4 py-2 text-sm text-[#B8A697] hover:bg-[#38251B]"
+                  >
+                    Cancel
+                  </button>
+                </div>
+              </div>
+            )}
+            {deleteErr && (
+              <p className="mt-3 text-sm text-[#C7838B]">{deleteErr}</p>
+            )}
+          </div>
+        )}
       </aside>
     </div>
   );
@@ -478,6 +551,11 @@ export default function Home() {
 
   const [analytics, setAnalytics] = useState<Analytics | null>(null);
   const [analyticsError, setAnalyticsError] = useState("");
+
+  const [adminStats, setAdminStats] = useState<AdminStats | null>(null);
+  const [workload, setWorkload] = useState<WorkloadRow[]>([]);
+  const [workloadMin, setWorkloadMin] = useState(1);
+  const [adminError, setAdminError] = useState("");
 
   const [selectedId, setSelectedId] = useState<number | null>(null);
 
@@ -565,6 +643,34 @@ export default function Home() {
     loadAnalytics();
   }, [activeNav, tickets]);
 
+  useEffect(() => {
+    if (activeNav !== "Analytics" || user?.role !== "admin") return;
+    async function loadAdminReports() {
+      try {
+        const [statsRes, workRes] = await Promise.all([
+          fetch("/api/stats"),
+          fetch(`/api/reports/agent-workload?min=${workloadMin}`),
+        ]);
+        const statsData = await statsRes.json();
+        const workData = await workRes.json();
+        if (!statsRes.ok) {
+          throw new Error(statsData.error || "Failed to load stats");
+        }
+        if (!workRes.ok) {
+          throw new Error(workData.error || "Failed to load workload report");
+        }
+        setAdminStats(statsData as AdminStats);
+        setWorkload((workData.agents ?? []) as WorkloadRow[]);
+        setAdminError("");
+      } catch (err) {
+        setAdminError(
+          err instanceof Error ? err.message : "Failed to load admin reports"
+        );
+      }
+    }
+    loadAdminReports();
+  }, [activeNav, tickets, user, workloadMin]);
+
   async function submitTicket(e: FormEvent) {
     e.preventDefault();
     setSubmitting(true);
@@ -631,6 +737,11 @@ export default function Home() {
   }
 
   async function handleResolved() {
+    await Promise.all([loadTickets(), loadSolutions()]);
+  }
+
+  async function handleDeleted() {
+    setSelectedId(null);
     await Promise.all([loadTickets(), loadSolutions()]);
   }
 
@@ -737,6 +848,7 @@ export default function Home() {
 
   const selected = tickets.find((t) => t.id === selectedId) ?? null;
   const isCustomer = user?.role === "customer";
+  const isAdmin = user?.role === "admin";
   const recent = filteredTickets.slice(0, 8);
 
   const statCards = [
@@ -1326,6 +1438,102 @@ export default function Home() {
                     </div>
                   </article>
                 </div>
+
+                {isAdmin && (
+                  <div className="border-t border-[#594438] py-8">
+                    <p className="text-[10px] uppercase tracking-[0.2em] text-[#9E8B7A]">
+                      Admin only
+                    </p>
+                    <h2 className="mt-2 text-xl font-bold">Operations report</h2>
+
+                    {adminError && (
+                      <p className="mt-4 text-sm text-[#C7838B]">{adminError}</p>
+                    )}
+
+                    {adminStats && (
+                      <div className="mt-6 grid grid-cols-2 border-y border-[#594438] sm:grid-cols-4">
+                        <Metric
+                          index={0}
+                          label="DEFLECTION RATE"
+                          value={`${adminStats.deflection_rate}%`}
+                          note="Deflected of all tickets"
+                        />
+                        <Metric
+                          index={1}
+                          label="ALL TICKETS"
+                          value={pad(adminStats.total)}
+                          note="Counted from ticket_summary"
+                        />
+                        <Metric
+                          index={2}
+                          label="DEFLECTED"
+                          value={pad(adminStats.deflected)}
+                          note="Solved without an agent"
+                        />
+                        <Metric
+                          index={3}
+                          label="SLA BREACHED"
+                          value={pad(adminStats.sla_breached)}
+                          note="Unfinished and overdue"
+                        />
+                      </div>
+                    )}
+
+                    <div className="mt-10 flex flex-wrap items-end justify-between gap-4">
+                      <div>
+                        <h3 className="text-lg font-bold">Agent workload</h3>
+                        <p className="mt-1 text-sm text-[#B8A697]">
+                          Agents with at least this many active (assigned or
+                          in progress) tickets.
+                        </p>
+                      </div>
+                      <label className="flex items-center gap-3 text-sm text-[#B8A697]">
+                        Minimum active tickets
+                        <select
+                          value={workloadMin}
+                          onChange={(e) => setWorkloadMin(Number(e.target.value))}
+                          className="border border-[#594438] bg-[#2C1A0E] px-3 py-2 text-sm text-[#F5F0E8]"
+                        >
+                          {[1, 2, 3, 5, 10].map((n) => (
+                            <option key={n} value={n}>
+                              {n}
+                            </option>
+                          ))}
+                        </select>
+                      </label>
+                    </div>
+
+                    <table className="mt-4 w-full text-left text-sm">
+                      <thead>
+                        <tr className="border-b border-[#594438] text-[10px] uppercase tracking-[0.15em] text-[#9E8B7A]">
+                          <th className="py-3 pr-4 font-medium">Agent</th>
+                          <th className="px-4 py-3 font-medium">Active tickets</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {workload.map((row) => (
+                          <tr key={row.id} className="border-b border-[#453025]">
+                            <td className="py-4 pr-4 font-medium">{row.name}</td>
+                            <td className="px-4 py-4 text-[#B8A697]">
+                              {row.active_tickets}
+                            </td>
+                          </tr>
+                        ))}
+                        {workload.length === 0 && (
+                          <tr>
+                            <td
+                              colSpan={2}
+                              className="py-8 text-center text-sm text-[#9E8B7A]"
+                            >
+                              No agent has at least {workloadMin} active
+                              ticket{workloadMin === 1 ? "" : "s"}.
+                            </td>
+                          </tr>
+                        )}
+                      </tbody>
+                    </table>
+                  </div>
+                )}
               </>
             )}
           </section>
@@ -1345,6 +1553,7 @@ export default function Home() {
           user={user}
           onClose={() => setSelectedId(null)}
           onResolved={handleResolved}
+          onDeleted={handleDeleted}
         />
       )}
     </main>
